@@ -1,0 +1,206 @@
+
+``` {r}
+# Load Data
+data <- read.csv("lens_regeneration_data.csv", header=TRUE)
+
+# Remove extraneous column
+data$X <- NULL  
+
+# Exclude header rows from the multiple excell data sheets
+data <- data[data$Rep != "Rep",]
+
+# Reset row indices
+row.names(data) <- NULL 
+
+# Create Age and Day variables
+data$Age <- rep(c(rep("Larvae", 162), rep("Juvenile", 162), rep("Adult", 162)), 4)
+data$Day <- rep(c(rep(1, 486), rep(4, 486), rep(10, 486), rep(15, 486)))
+
+# Convert Age to a factor variable and set reference levels
+data$Age <- relevel(factor(data$Age), ref="Larvae")
+
+# Convert certain columns to numeric for modeling
+data[c("DAPI", "EdU")] <- lapply(data[c("DAPI", "EdU")], as.numeric)
+
+# Add totals for EdU and DAPI columns (they were not there originally for some reason)
+edu_totals <- c()
+dapi_totals <- c()
+for (i in seq(3, length(data$EdU), by=3)) {
+  edu_totals <- c(edu_totals, sum(data$EdU[(i-2):(i-1)]))
+  dapi_totals <- c(dapi_totals, sum(data$DAPI[(i-2):(i-1)]))
+}
+
+# Filter data to keep only total cell counts (every third row)
+data <- data[seq(1, nrow(data),3),]
+data$EdU <- edu_totals
+data$DAPI <- dapi_totals
+```
+
+
+```{r}
+library(MASS)
+
+# Negative binomial model
+glm_negbinom <- glm.nb(EdU ~ Day + I(Day^2) + Age + Day:Age + I(Day^2):Age + offset(log(DAPI)), data=data)
+summary(glm_negbinom)
+
+
+# Create the negative binomial curve functions using coefficients from the bootstrap sample
+coefs_negbinom <- glm_negbinom$coefficients
+larvae_curve_negbinom <- function(x) coefs_negbinom[1] + coefs_negbinom[2]*x + coefs_negbinom[3]*x^2
+juvenile_curve_negbinom <- function(x) (coefs_negbinom[1]+coefs_negbinom[5]) + (coefs_negbinom[2]+coefs_negbinom[7])*x + (coefs_negbinom[3]+coefs_negbinom[9])*x^2
+adult_curve_negbinom <- function(x) (coefs_negbinom[1]+coefs_negbinom[4]) + (coefs_negbinom[2]+coefs_negbinom[6])*x + (coefs_negbinom[3]+coefs_negbinom[8])*x^2
+
+larvae_max <- optimize(larvae_curve_negbinom, interval = c(0, 20), maximum = TRUE)
+juvenile_max <- optimize(juvenile_curve_negbinom, interval = c(0, 20), maximum = TRUE)
+adult_max <- optimize(adult_curve_negbinom, interval = c(0, 20), maximum = TRUE)
+```
+
+``` {r}
+# Bootstrapping
+
+library(MASS)
+library(boot)
+
+# Define a function to fit the negative binomial model and return the maxima
+nb_maxima <- function(data, indices) {
+  sample_data <- data[indices, ]
+  glm_negbinom <- glm.nb(EdU ~ Day + I(Day^2) + Age + Day:Age + I(Day^2):Age + offset(log(DAPI)), data=sample_data)
+  
+  # Create the negative binomial curve functions using coefficients from the bootstrap sample
+  coefs_negbinom <- glm_negbinom$coefficients
+  larvae_curve_negbinom <- function(x) coefs_negbinom[1] + coefs_negbinom[2]*x + coefs_negbinom[3]*x^2
+  juvenile_curve_negbinom <- function(x) (coefs_negbinom[1]+coefs_negbinom[5]) + (coefs_negbinom[2]+coefs_negbinom[7])*x + (coefs_negbinom[3]+coefs_negbinom[9])*x^2
+  adult_curve_negbinom <- function(x) exp((coefs_negbinom[1]+coefs_negbinom[4]) + (coefs_negbinom[2]+coefs_negbinom[6])*x + (coefs_negbinom[3]+coefs_negbinom[8])*x^2)
+  
+  # Find the maxima for each curve
+  larvae_max <- optimize(larvae_curve_negbinom, interval = c(0, 20), maximum = TRUE)$maximum
+  juvenile_max <- optimize(juvenile_curve_negbinom, interval = c(0, 20), maximum = TRUE)$maximum
+  adult_max <- optimize(adult_curve_negbinom, interval = c(0, 20), maximum = TRUE)$maximum
+  
+  return(c(larvae_max, juvenile_max, adult_max))
+}
+
+# Bootstrap
+set.seed(5)  # for reproducibility
+results <- boot(data = data, statistic = nb_maxima, R = 10000)
+
+# 95% Confidence Intervals
+larvae_ci <- quantile(results$t[,1], c(0.025, 0.975))
+juvenile_ci <- quantile(results$t[,2], c(0.025, 0.975))
+adult_ci <- quantile(results$t[,3], c(0.025, 0.975))
+
+larvae_ci
+juvenile_ci
+adult_ci
+```
+```{r}
+# Plot the Graph with CI's included
+
+# Define the Confidence Intervals
+larvae_ci <- c(6.663540, 7.334681)
+juvenile_ci <- c(10.13767, 10.79974)
+adult_ci <- c(11.0610, 11.9189)
+
+# Add a modified response
+data$log_edu_dapi <- log(data$EdU/data$DAPI)
+# Make a dataframe where log(edu/hoechst) -infinity observations are ommited
+data2 <- subset(data, log_edu_dapi != -Inf)
+
+plot(x = c(-2, 20), y = c(-4, 0), type = "n", xlab = "Day", ylab = "log(EdU+/DAPI)")
+title("Response Variable Curves of Fitted Negative Binomial Model")
+
+legend("topright", legend=c("Larvae", "Juvenile", "Adult"), col=c("red", "blue", "chartreuse3"), lwd=2)
+
+
+curve(larvae_curve_negbinom, col = "red", add = TRUE, lwd=2)
+curve(juvenile_curve_negbinom, col = "blue", add = TRUE, lwd=2)
+curve(adult_curve_negbinom, col = "chartreuse3", add = TRUE, lwd=2)
+points(x=jitter(subset(data2, Age=='Larvae')$Day, amount=0.2), y=subset(data2, Age=='Larvae')$log_edu_dapi, col="red")
+points(x=jitter(subset(data2, Age=='Juvenile')$Day, amount=0.2), y=subset(data2, Age=='Juvenile')$log_edu_dapi, col="blue")
+points(x=jitter(subset(data2, Age=='Adult')$Day, amount=0.2), y=subset(data2, Age=='Adult')$log_edu_dapi, col="chartreuse3", lwd=1)
+points(x=larvae_max$maximum, y=larvae_max$objective, col="black", pch=19)
+points(x=juvenile_max$maximum, y=juvenile_max$objective, col="black", pch=19)
+points(x=adult_max$maximum, y=adult_max$objective, col="black", pch=19)
+abline(v = larvae_max$maximum, lty = 2)
+abline(v = juvenile_max$maximum, lty = 2)
+abline(v = adult_max$maximum, lty = 2)
+
+```
+``` {r}
+# Plot the Graph with CI's included
+
+# Define the Confidence Intervals
+larvae_ci <- c(6.663540, 7.334681)
+juvenile_ci <- c(10.13767, 10.79974)
+adult_ci <- c(11.0610, 11.9189)
+
+# Initialize the Plot
+plot(x = c(-2, 20), y = c(-4, 0), type = "n", xlab = "Day", ylab = "log(EdU+/DAPI)")
+title("Response Variable Curves of Fitted Negative Binomial Model")
+
+# Add Curves
+curve(larvae_curve_negbinom, col = "red", add = TRUE, lwd=2)
+curve(juvenile_curve_negbinom, col = "blue", add = TRUE, lwd=2)
+curve(adult_curve_negbinom, col = "chartreuse3", add = TRUE, lwd=2)
+
+# Add Points
+points(x=jitter(subset(data2, Age=='Larvae')$Day, amount=0.2), y=subset(data2, Age=='Larvae')$log_edu_dapi, col="red")
+points(x=jitter(subset(data2, Age=='Juvenile')$Day, amount=0.2), y=subset(data2, Age=='Juvenile')$log_edu_dapi, col="blue")
+points(x=jitter(subset(data2, Age=='Adult')$Day, amount=0.2), y=subset(data2, Age=='Adult')$log_edu_dapi, col="chartreuse3", lwd=1)
+
+# Add maxima
+points(x=larvae_max$maximum, y=larvae_max$objective, col="black", pch=19)
+points(x=juvenile_max$maximum, y=juvenile_max$objective, col="black", pch=19)
+points(x=adult_max$maximum, y=adult_max$objective, col="black", pch=19)
+
+# Add Grey Shaded Regions for Confidence Intervals
+rect(larvae_ci[1], par("usr")[3], larvae_ci[2], par("usr")[4], col=rgb(0.5, 0.5, 0.5, 0.2), border=NA)
+rect(juvenile_ci[1], par("usr")[3], juvenile_ci[2], par("usr")[4], col=rgb(0.5, 0.5, 0.5, 0.2), border=NA)
+rect(adult_ci[1], par("usr")[3], adult_ci[2], par("usr")[4], col=rgb(0.5, 0.5, 0.5, 0.2), border=NA)
+
+# Get user coordinates for the plot
+usr <- par("usr")
+
+# Manually specify coordinates for the legend box
+legend_x_left <- 15
+legend_y_bottom <- -1.5  # Reduced height for smaller spacing
+
+# Draw only two sides of the legend box
+segments(legend_x_left, legend_y_bottom, legend_x_left, usr[4], col = "black")
+segments(legend_x_left, legend_y_bottom, usr[2], legend_y_bottom, col = "black")
+
+# Add colored lines and texts for "Larvae", "Juvenile", "Adult"
+line_y <- -0.1  # Adjusted for smaller spacing
+text_x <- legend_x_left + 1.8
+text_y <- line_y
+segments(legend_x_left + 0.5, line_y, legend_x_left + 1.5, line_y, col = "red", lwd = 2)
+text(text_x, text_y, "Larvae", pos = 4, cex = 0.8)
+
+line_y <- -0.42  # Adjusted for smaller spacing
+text_y <- line_y
+segments(legend_x_left + 0.5, line_y, legend_x_left + 1.5, line_y, col = "blue", lwd = 2)
+text(text_x, text_y, "Juvenile", pos = 4, cex = 0.8)
+
+line_y <- -0.74  # Adjusted for smaller spacing
+text_y <- line_y
+segments(legend_x_left + 0.5, line_y, legend_x_left + 1.5, line_y, col = "chartreuse3", lwd = 2)
+text(text_x, text_y, "Adult", pos = 4, cex = 0.8)
+
+# Add grey box for "Bootstrapped 95% CI"
+rect_x_left <- legend_x_left + 0.5
+rect_x_right <- legend_x_left + 1.5
+rect_y_top <- -1.04  # Adjusted for smaller spacing
+rect_y_bottom <- -1.32  # Adjusted for smaller spacing
+rect(rect_x_left, rect_y_bottom, rect_x_right, rect_y_top, 
+     col = rgb(0.5, 0.5, 0.5, 0.2), border = NA)
+
+# Add wrapped text next to the grey rectangle
+text_x <- legend_x_left + 1.8
+text_y <- -1.06  # Adjusted for smaller spacing
+text(text_x, text_y, "Bootstrapped", pos = 4, cex = 0.8)
+text_y <- -1.30  # Adjusted for smaller spacing
+text(text_x, text_y, "95% CI", pos = 4, cex = 0.8)
+
+
+```
